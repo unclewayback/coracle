@@ -135,6 +135,9 @@ static struct {
     volatile uint8_t suspended;  /* bus idle > 3 ms (unplugged or host asleep): the UI hides "USB" */
     uint8_t last_setup[8];
     uint8_t sysex[16];
+    uint8_t asx[256];                  /* app SysEx ring (our draw frames) */
+    volatile uint8_t asx_w, asx_r;
+    uint8_t asx_route;                 /* this frame is the app's, not the updater's */
     uint8_t sx_len, sx_on;
     volatile uint8_t uboot_req;
     volatile uint8_t ota_req;    /* F0 22 24 35 7F F7: M-UPGRADE upgrade command (FELUCCA_OTA) */
@@ -672,12 +675,32 @@ stall:
 }
 
 /* SysEx assembly: only short commands matter here */
+
+static void asx_push(uint8_t b)
+{
+    uint8_t n = (uint8_t)((usb.asx_w + 1u) % sizeof usb.asx);
+    if (n != usb.asx_r) {              /* full ring: byte dropped, frame dies on its CRC-free diet */
+        usb.asx[usb.asx_w] = b;
+        usb.asx_w = n;
+    }
+}
+
+uint8_t sysex_app_get(uint8_t *b)      /* the app's drain: 1 and the byte, or 0 */
+{
+    if (usb.asx_r == usb.asx_w)
+        return 0;
+    *b = usb.asx[usb.asx_r];
+    usb.asx_r = (uint8_t)((usb.asx_r + 1u) % sizeof usb.asx);
+    return 1;
+}
+
 static void sysex_byte(uint8_t b)
 {
     static const uint8_t UBOOT_KEY[6] = {0xF0, 0x22, 0x24, 0x35, 0x7D, 0xF7};
     if (b >= 0xF8u)
         return;                                        /* realtime may occur anywhere in SysEx */
     if ((b & 0x80u) && b != 0xF0u && b != 0xF7u) {
+        usb.asx_route = 0;
         usb.sx_on = 0;
 #if FELUCCA_OTA
         sx_collect = 0;
@@ -702,6 +725,11 @@ static void sysex_byte(uint8_t b)
             sx_collect = 0;                             /* too long: not ours */
     }
 #endif
+
+if (b != 0xF0u && b != 0xF7u && usb.sx_len == 1u && b != 0x22u)
+    usb.asx_route = 1;              /* first data byte not 0x22: ours to copy */
+    if (usb.asx_route && b != 0xF0u)
+        asx_push(b);                    /* copied, never intercepted: the OTA ring keeps every frame, so the update loader still hears the installer's handshake */
     if (usb.sx_len < sizeof usb.sysex)
         usb.sysex[usb.sx_len++] = b;
     if (b == 0xF7) {
@@ -722,6 +750,7 @@ static void sysex_byte(uint8_t b)
         sx_collect = 0;
 #endif
         usb.sx_on = 0;
+        usb.asx_route = 0;
     }
 }
 
