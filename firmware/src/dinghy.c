@@ -2,14 +2,19 @@
 /* Coracle: a Dinghy fork that makes the FM-1 a Pure Data control surface.
  *
  * Two modes, switched by SysEx (0x40 <1|0>, status query 0x7F):
- *   TAKEOVER (on at boot)      the whole panel belongs to Pure Data
- *   OFF                       reserved for the standalone firmware to come
+ *   TAKEOVER                  the whole panel belongs to Pure Data
+ *   OFF (standalone)          the panel plays the cos3v3 heavy engine:
+ *                             keys 0-26 trigger notes 60-86, KNOB1-4 set the
+ *                             page's params, SELECT toggles the page
+ *                             (host builds boot here; the device, where the
+ *                             engine is not linked yet, boots in takeover)
  *
  * Takeover talks on MIDI **channel 13** (0x9C/0xBC/0xEC); channels 1-10 stay
  * free for the future standard-control mode. The FM-1 sends its panel as:
  *   keys 0-26, buttons 27-40   as note on (vel 127) / note off (vel 0)
  *   encoders 1-7               as CC 1-7: 65 = +1 detent, 63 = -1 detent
- *                              (1-4 = KNOB1-4, 5 = SELECT, 6 = ALGORITHM, 7 = PRESETS)
+ *                              (1-4 = KNOB1-4, 5 = SELECT, 6 = PRESETS, 7 = ALGORITHM,
+ *                              reading left to right across the panel)
  *   MASTER knob               as pitch bend, the raw 0..1023 of the ADC
  *
  * Pd drives the panel back (channel 13):
@@ -42,15 +47,36 @@ static int32_t fm1_adc_read(uint32_t ch) { (void)ch; return -1; }  /* -1 = not r
 extern uint8_t sysex_app_get(uint8_t *b);
 #endif
 
-/* ---- the sound: none (Pd does the audio; the FM-1 stays silent) */
+/* ---- the mode: 1 = the panel is Pd's (takeover), 0 = the standalone side.
+ *      Host builds boot standalone (the engine lives there); the device, where
+ *      the heavy engine is not linked yet, boots in takeover. */
+#ifdef DINGHY_HOST
+static uint8_t takeover = 0;
+#else
+static uint8_t takeover = 1;
+#endif
+
+/* ---- the standalone engine: cos3v3, a Heavy-compiled Pd patch.
+ *      Host builds compile it in (engine.c; also the ceiling test); the device
+ *      build keeps stubs until the context's C++ and allocator needs are
+ *      sorted for the JieLi toolchain. */
+#ifdef DINGHY_HOST
+#include "engine.c"
+#else
+static void engine_init(void) { }
+static void engine_key(uint32_t key, uint8_t down) { (void)key; (void)down; }
+static void engine_knob(uint32_t knob, int32_t delta) { (void)knob; (void)delta; }
+static void engine_select(void) { }
+static uint8_t engine_page(void) { return 0u; }
+static void engine_audio(int32_t *out, uint32_t n) { (void)out; (void)n; }
+#endif
+
+/* ---- the sound */
 static void app_audio(int32_t *out, uint32_t n)
 {
-    (void)out; (void)n;
+    if (!takeover)
+        engine_audio(out, n);
 }
-
-/* ---- the takeover mode: 1 = the panel is Pd's, 0 = the standalone side's.
- *      On at boot, until Pd (or a future menu) says otherwise. */
-static uint8_t takeover = 1;
 
 #define TAK_CC 121u                        /* mode ACK: CC 121 on ch 13 */
 static void mode_reply(void)
@@ -64,10 +90,11 @@ static void panel_out(void)
     static uint32_t prev = 0;                   /* keys held last time round */
     uint32_t keys, down, up, k;
 
-    if (!takeover)
+    if (!takeover) {
         return;                                /* the standalone side owns it */
-        keys = fm1_in.notes;                        /* bit k: key k (0 = F3 .. 26 = G5) */
-        down = keys & ~prev;
+    }
+    keys = fm1_in.notes;                        /* bit k: key k (0 = F3 .. 26 = G5) */
+    down = keys & ~prev;
     up = prev & ~keys;
     prev = keys;
     for (k = 0; k < 27u; k++) {
@@ -83,10 +110,11 @@ static void panel_out(void)
         }
     }
 
-    {   /* encoders: CC 1-7, one message per detent: 65 = +1, 63 = -1 */
+    {   /* encoders: CC 1-7, one message per detent: 65 = +1, 63 = -1
+        (CC order reads left to right across the panel) */
         static const uint8_t id[7] = {
             ENC_KNOB1, ENC_KNOB2, ENC_KNOB3, ENC_KNOB4,
-            ENC_SELECT, ENC_ALGORITHM, ENC_PRESETS
+            ENC_SELECT, ENC_PRESETS, ENC_ALGORITHM
         };
         uint32_t i;
         for (i = 0; i < 7u; i++) {
@@ -250,17 +278,57 @@ static void sysex_in(void)
     }
 }
 
+/* ---- the standalone panel: the engine's controls (not takeover) */
+static void standalone_panel(void)
+{
+    static uint32_t prev = 0;
+    static uint8_t pg = 255u;
+    uint32_t keys, down, k, brel;
+    int32_t d;
+    uint8_t i;
+
+    keys = fm1_in.notes;                        /* held keys light their LEDs */
+    down = keys & ~prev;
+    prev = keys;
+    for (k = 0; k < 27u; k++) {
+        if (down >> k & 1u) {
+            engine_key(k, 1);                   /* one-shot: press triggers */
+        }
+        fm1_led_key(KEY_LED(k), keys >> k & 1u);
+    }
+    fm1_input_edges(&brel);                      /* buttons: reserved for menus */
+    d = fm1_enc_take(ENC_SELECT);
+    if (d)
+        engine_select();
+    for (i = 0; i < 4u; i++) {
+        d = fm1_enc_take(ENC_KNOB1 + i);
+        if (d)
+            engine_knob(i, d);
+    }
+    if (pg != engine_page()) {                  /* the page label */
+        pg = engine_page();
+        draw_text_box(0, 52, 240, &FONT_S,
+                      pg ? "DECAY  CLIP  VEL  -" : "F1  F2  SHAPE  MOD",
+                      RGB(180, 140, 255), 1);
+    }
+}
+
 /* ---- main */
 static void app_main(void)
 {
+    engine_init();
     lcd_fill(0, 0, 240, 240, C_BLACK);
     draw_text_box(0, 96, 240, &FONT_L, APP_NAME, RGB(180, 140, 255), 1);
     draw_text_box(0, 140, 240, &FONT_S, "Pd link  v" APP_VER, RGB(90, 90, 90), 1);
 
     for (;;) {
         platform_poll();                           /* watchdog, USB, the updater */
-        panel_out();
-        midi_in_leds();
-        sysex_in();
+        if (takeover) {
+            panel_out();
+            midi_in_leds();
+        } else {
+            standalone_panel();
+        }
+        sysex_in();                                /* the mode switch always works */
     }
 }
